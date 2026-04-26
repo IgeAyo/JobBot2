@@ -59,14 +59,15 @@ def sync_to_sheets(jobs: list):
 def run():
     client = ApifyClient(APIFY_TOKEN)
     run_input = {
-        "queries": ", ".join(KEYWORDS),
-        "locations": "Lagos, Nigeria",
-        "maxItems": 40,
-        "maxAgeDays": 4,
-        "extendOutputFunction": "($) => ({})"
+        "keywords": ", ".join(KEYWORDS),
+        "location": "Lagos, Nigeria",
+        "maxJobs": 40,
+        "daysOld": 4,
+        "sources": ["indeed", "linkedin", "glassdoor"]
+    }
     }
     print("🔄 Running Apify job search...")
-    run = client.actor("apify/job-search").call(run_input=run_input, wait_secs=120)
+    run = client.actor("gauravsaran/linkedin-indeed-glassdoor-job-scraper").call(run_input=run_input, wait_secs=120)
     dataset = client.dataset(run["defaultDatasetId"]).list_items().items
     seen_urls = set()
     matched = []
