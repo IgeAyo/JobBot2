@@ -12,7 +12,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - run: pip install apify-client gspread google-auth requests
+      - run: pip install apify-client gspread google-auth requests beautifulsoup4
       - name: Run Job Scraper
         env:
           APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
