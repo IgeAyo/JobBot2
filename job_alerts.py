@@ -1,8 +1,9 @@
-import os, json, re, base64, requests
+import os, json, re, base64, requests, time
 from apify_client import ApifyClient
 import gspread
 from google.oauth2.service_account import Credentials
 
+# ================= CONFIG =================
 APIFY_TOKEN = os.getenv("APIFY_API_TOKEN")
 SHEET_CREDS_B64 = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
@@ -13,6 +14,7 @@ TARGET_LOCATION = "lagos"
 MIN_SALARY_NGN = 175000
 ENTRY_LEVEL_TAGS = ["entry", "junior", "intern", "graduate", "associate"]
 
+# ================= HELPER FUNCTIONS =================
 def parse_salary(text: str) -> float:
     if not text: return 0
     cleaned = re.sub(r'[₦,kKmM\s]', '', str(text), flags=re.IGNORECASE)
@@ -33,10 +35,7 @@ def filter_job(job: dict) -> bool:
 
 def send_webhook(jobs: list):
     if not jobs: return
-    payload = {
-        "content": "🇳🇬 **New Job Matches Found**\n",
-        "embeds": []
-    }
+    payload = {"content": "🇳🇬 **New Job Matches Found**\n", "embeds": []}
     for j in jobs[:5]:
         payload["embeds"].append({
             "title": f"{j['title']} @ {j['company']}",
@@ -56,27 +55,68 @@ def sync_to_sheets(jobs: list):
     rows = [[os.getenv("GITHUB_SHA", "manual")[:7], j["title"], j["company"], j["location"], j.get("salary", ""), j["url"], "Not Applied"] for j in jobs]
     sheet.append_rows(rows, value_input_option="USER_ENTERED")
 
+# ================= MAIN =================
 def run():
     client = ApifyClient(APIFY_TOKEN)
-    run_input = {
-        "keywords": ", ".join(KEYWORDS),
-        "location": "Lagos, Nigeria",
-        "maxJobs": 40,
-        "daysOld": 4,
-        "sources": ["indeed", "linkedin", "glassdoor"]
-    }
-    }
-    print("🔄 Running Apify job search...")
-    run = client.actor("gauravsaran/linkedin-indeed-glassdoor-job-scraper").call(run_input=run_input, wait_secs=120)
-    dataset = client.dataset(run["defaultDatasetId"]).list_items().items
-    seen_urls = set()
     matched = []
-    for item in dataset:
-        url = item.get("url", "")
-        if url in seen_urls: continue
-        seen_urls.add(url)
-        if filter_job(item):
-            matched.append(item)
+    seen_urls = set()
+    
+    # Build search URLs for Nigerian job boards
+    urls = []
+    for kw in KEYWORDS:
+        kw_enc = kw.replace(" ", "%20")
+        urls.append(f"https://www.jobberman.com/jobs?keyword={kw_enc}&location=Lagos")
+        urls.append(f"https://www.myjobmag.com/jobs/keyword/{kw.replace(' ', '-')}/lagos")
+    
+    # Use official Apify website crawler (most reliable)
+    run_input = {
+        "startUrls": [{"url": u} for u in urls],
+        "maxCrawlPages": 30,
+        "maxRequestRetries": 2,
+        "requestTimeoutSecs": 60,
+        "pageFunction": """async function pageFunction(context) {
+            const $ = context.jQuery;
+            const pageTitle = $('title').text();
+            // Skip non-job pages
+            if (!pageTitle.toLowerCase().includes('job')) return;
+            
+            // Extract job data (generic fallback - customize per site if needed)
+            return {
+                title: $('h1').first().text().trim() || $('[itemprop="title"]').text().trim(),
+                company: $('[itemprop="hiringOrganization"]').text().trim() || $('.company-name').text().trim(),
+                location: $('[itemprop="jobLocation"]').text().trim() || $('.location').text().trim(),
+                salary: $('.salary').text().trim() || $('[itemprop="baseSalary"]').text().trim(),
+                url: context.request.url,
+                description: $('body').text().slice(0, 2000)
+            };
+        }"""
+    }
+    
+    print("🔄 Running Apify website crawler...")
+    try:
+        run = client.actor("apify/website-content-crawler").call(run_input=run_input, wait_secs=180)
+        dataset = client.dataset(run["defaultDatasetId"]).list_items().items
+        
+        for item in dataset:
+            url = item.get("url", "")
+            if not url or url in seen_urls: continue
+            seen_urls.add(url)
+            # Normalize keys
+            job = {
+                "title": item.get("title", "") or item.get("pageTitle", ""),
+                "company": item.get("company", "") or item.get("organization", ""),
+                "location": item.get("location", "") or item.get("address", ""),
+                "salary": item.get("salary", ""),
+                "url": url,
+                "description": item.get("description", "") or item.get("text", "")
+            }
+            if filter_job(job):
+                matched.append(job)
+                
+    except Exception as e:
+        print(f"⚠️ Apify crawl failed: {e}")
+        return  # Exit early to avoid sheet/webhook errors
+    
     print(f"✅ Found {len(matched)} matching jobs.")
     if matched:
         sync_to_sheets(matched)
