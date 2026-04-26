@@ -17,14 +17,11 @@ ENTRY_LEVEL_TAGS = ["entry", "junior", "intern", "graduate", "associate", "nysc"
 # ================= HELPER FUNCTIONS =================
 def parse_salary(text: str) -> float:
     if not text: return 0
-    # Handle Nigerian formats: ₦175k, 175,000 NGN, ₦180,000 - ₦250,000
     cleaned = re.sub(r'[₦,\s]', '', str(text).lower())
-    # Extract all numbers
     nums = re.findall(r'(\d+)(?:k|kngn|ngn)?', cleaned)
     if not nums: return 0
-    # Convert 'k' suffix to thousands
     values = [float(n) * (1000 if 'k' in cleaned else 1) for n in nums]
-    return min(values)  # Use lower bound of salary range
+    return min(values)
 
 def is_entry_level(title: str, desc: str) -> bool:
     combined = (title + " " + desc).lower()
@@ -37,29 +34,21 @@ def filter_job(job: dict, debug: bool = False) -> bool:
     salary_text = job.get("salary", "")
     description = job.get("description", "")
     
-    # Location check (more flexible)
     if TARGET_LOCATION not in location and "lagos state" not in location:
         if debug: print(f"  ❌ Location fail: '{location}'")
         return False
-    
-    # Salary check
     salary_num = parse_salary(salary_text)
-    if salary_num < MIN_SALARY_NGN and salary_num > 0:  # Only filter if salary was detected
+    if salary_num < MIN_SALARY_NGN and salary_num > 0:
         if debug: print(f"  ❌ Salary fail: '{salary_text}' → ₦{salary_num:,.0f} < ₦{MIN_SALARY_NGN:,}")
         return False
-    
-    # Entry-level check
     if not is_entry_level(title, description):
-        if debug: print(f"  ❌ Level fail: title='{title}', desc snippet='{description[:50]}...'")
+        if debug: print(f"  ❌ Level fail")
         return False
-    
-    # Keyword check
     title_desc = (title + " " + description).lower()
     if not any(kw in title_desc for kw in KEYWORDS):
-        if debug: print(f"  ❌ Keyword fail: none of {KEYWORDS} in title/desc")
+        if debug: print(f"  ❌ Keyword fail")
         return False
-    
-    if debug: print(f"  ✅ MATCH: {title} @ {company} | ₦{salary_num:,.0f} | {location}")
+    if debug: print(f"  ✅ MATCH: {title} @ {company}")
     return True
 
 def send_webhook(jobs: list):
@@ -90,31 +79,43 @@ def run():
     matched = []
     seen_urls = set()
     
-    # Build search URLs for Nigerian job boards
     urls = []
     for kw in KEYWORDS:
         kw_enc = kw.replace(" ", "%20")
         urls.append(f"https://www.jobberman.com/jobs?keyword={kw_enc}&location=Lagos")
         urls.append(f"https://www.myjobmag.com/jobs/keyword/{kw.replace(' ', '-')}/lagos")
     
+    # ✅ FIXED: Playwright-native pageFunction (no jQuery $)
     run_input = {
         "startUrls": [{"url": u} for u in urls],
-        "maxCrawlPages": 20,  # Lower for faster debug
+        "maxCrawlPages": 20,
         "maxRequestRetries": 1,
         "requestTimeoutSecs": 45,
+        "usePlaywright": True,
         "pageFunction": """async function pageFunction(context) {
-            const $ = context.jQuery;
-            const pageTitle = $('title').text().toLowerCase();
-            if (!pageTitle.includes('job') && !pageTitle.includes('career')) return;
+            const { page, request } = context;
+            // Wait for page to load
+            await page.waitForLoadState('networkidle').catch(() => {});
             
-            // Try multiple selectors for Nigerian sites
+            // Skip if not a job page
+            const title = await page.title();
+            if (!title.toLowerCase().includes('job') && !title.toLowerCase().includes('career')) return;
+            
+            // Extract using Playwright-native selectors (no $)
+            const extractText = async (selector) => {
+                try {
+                    const el = await page.$(selector);
+                    return el ? await el.evaluate(el => el.textContent.trim()) : '';
+                } catch { return ''; }
+            };
+            
             return {
-                title: $('h1').first().text().trim() || $('[itemprop="title"]').text().trim() || $('.job-title').text().trim(),
-                company: $('[itemprop="hiringOrganization"]').text().trim() || $('.company-name').text().trim() || $('.employer').text().trim(),
-                location: $('[itemprop="jobLocation"]').text().trim() || $('.location').text().trim() || $('.job-location').text().trim(),
-                salary: $('.salary').text().trim() || $('[itemprop="baseSalary"]').text().trim() || $('.remuneration').text().trim(),
-                url: context.request.url,
-                description: $('body').text().slice(0, 1500)
+                title: await extractText('h1') || await extractText('[itemprop="title"]') || await extractText('.job-title') || title,
+                company: await extractText('[itemprop="hiringOrganization"]') || await extractText('.company-name') || await extractText('.employer'),
+                location: await extractText('[itemprop="jobLocation"]') || await extractText('.location') || await extractText('.job-location'),
+                salary: await extractText('.salary') || await extractText('[itemprop="baseSalary"]') || await extractText('.remuneration'),
+                url: request.url,
+                description: await page.evaluate(() => document.body.innerText.slice(0, 1500))
             };
         }"""
     }
@@ -126,19 +127,17 @@ def run():
         
         print(f"📦 Received {len(dataset)} raw items from crawler")
         
-        # DEBUG: Print first 3 items to see what we got
+        # Debug: print first 3 items
         for i, item in enumerate(dataset[:3]):
             print(f"\n🔍 DEBUG ITEM {i+1}:")
-            for key in ["title", "company", "location", "salary", "url"]:
+            for key in ["title", "company", "location", "salary"]:
                 val = item.get(key, "N/A")
-                print(f"   {key}: {val[:100] if isinstance(val, str) and len(val) > 100 else val}")
+                print(f"   {key}: {str(val)[:100]}")
         
         for item in dataset:
             url = item.get("url", "")
             if not url or url in seen_urls: continue
             seen_urls.add(url)
-            
-            # Normalize keys from crawler output
             job = {
                 "title": item.get("title", "") or item.get("pageTitle", ""),
                 "company": item.get("company", "") or item.get("organization", ""),
@@ -147,8 +146,6 @@ def run():
                 "url": url,
                 "description": item.get("description", "") or item.get("text", "")
             }
-            
-            # Debug filter evaluation
             if filter_job(job, debug=True):
                 matched.append(job)
                 
@@ -162,7 +159,7 @@ def run():
         sync_to_sheets(matched)
         send_webhook(matched)
     else:
-        print("📭 No new matches this run. Check debug logs above to tune filters.")
+        print("📭 No new matches this run. Check debug logs above.")
 
 if __name__ == "__main__":
     run()
