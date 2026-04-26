@@ -1,4 +1,4 @@
-import os, json, re, base64, requests, time
+import os, json, re, base64, requests
 from apify_client import ApifyClient
 import gspread
 from google.oauth2.service_account import Credentials
@@ -27,28 +27,46 @@ def is_entry_level(title: str, desc: str) -> bool:
     combined = (title + " " + desc).lower()
     return any(tag in combined for tag in ENTRY_LEVEL_TAGS)
 
-def filter_job(job: dict, debug: bool = False) -> bool:
-    title = job.get("title", "")
-    company = job.get("company", "")
+def filter_job(job: dict, debug: bool = False, debug_id: str = "") -> bool:
+    title = job.get("title", "") or ""
+    company = job.get("company", "") or ""
     location = (job.get("location", "") or "").lower()
-    salary_text = job.get("salary", "")
-    description = job.get("description", "")
+    salary_text = job.get("salary", "") or ""
+    description = job.get("description", "") or ""
     
+    if debug:
+        print(f"\n🔎 FILTER DEBUG [{debug_id}]:")
+        print(f"   title: '{title[:80]}{'...' if len(title)>80 else ''}'")
+        print(f"   company: '{company[:50]}'")
+        print(f"   location: '{location}'")
+        print(f"   salary: '{salary_text}'")
+        print(f"   keywords in title/desc: {any(kw in (title+description).lower() for kw in KEYWORDS)}")
+    
+    # Location check
     if TARGET_LOCATION not in location and "lagos state" not in location:
-        if debug: print(f"  ❌ Location fail: '{location}'")
+        if debug: print(f"   ❌ REJECTED: location '{location}' doesn't contain '{TARGET_LOCATION}'")
         return False
+    
+    # Salary check (only reject if salary was detected but too low)
     salary_num = parse_salary(salary_text)
-    if salary_num < MIN_SALARY_NGN and salary_num > 0:
-        if debug: print(f"  ❌ Salary fail: '{salary_text}' → ₦{salary_num:,.0f} < ₦{MIN_SALARY_NGN:,}")
+    if salary_num > 0 and salary_num < MIN_SALARY_NGN:
+        if debug: print(f"   ❌ REJECTED: salary ₦{salary_num:,.0f} < ₦{MIN_SALARY_NGN:,}")
         return False
+    elif salary_num == 0 and debug:
+        print(f"   ⚠️  WARNING: Could not parse salary from '{salary_text}'")
+    
+    # Entry-level check
     if not is_entry_level(title, description):
-        if debug: print(f"  ❌ Level fail")
+        if debug: print(f"   ❌ REJECTED: no entry-level tags in title/desc")
         return False
+    
+    # Keyword check
     title_desc = (title + " " + description).lower()
     if not any(kw in title_desc for kw in KEYWORDS):
-        if debug: print(f"  ❌ Keyword fail")
+        if debug: print(f"   ❌ REJECTED: none of {KEYWORDS} found in title/desc")
         return False
-    if debug: print(f"  ✅ MATCH: {title} @ {company}")
+    
+    if debug: print(f"   ✅ PASSED ALL FILTERS")
     return True
 
 def send_webhook(jobs: list):
@@ -85,7 +103,6 @@ def run():
         urls.append(f"https://www.jobberman.com/jobs?keyword={kw_enc}&location=Lagos")
         urls.append(f"https://www.myjobmag.com/jobs/keyword/{kw.replace(' ', '-')}/lagos")
     
-    # ✅ FIXED: Playwright-native pageFunction (no jQuery $)
     run_input = {
         "startUrls": [{"url": u} for u in urls],
         "maxCrawlPages": 20,
@@ -94,21 +111,15 @@ def run():
         "usePlaywright": True,
         "pageFunction": """async function pageFunction(context) {
             const { page, request } = context;
-            // Wait for page to load
             await page.waitForLoadState('networkidle').catch(() => {});
-            
-            // Skip if not a job page
             const title = await page.title();
             if (!title.toLowerCase().includes('job') && !title.toLowerCase().includes('career')) return;
-            
-            // Extract using Playwright-native selectors (no $)
             const extractText = async (selector) => {
                 try {
                     const el = await page.$(selector);
                     return el ? await el.evaluate(el => el.textContent.trim()) : '';
                 } catch { return ''; }
             };
-            
             return {
                 title: await extractText('h1') || await extractText('[itemprop="title"]') || await extractText('.job-title') || title,
                 company: await extractText('[itemprop="hiringOrganization"]') || await extractText('.company-name') || await extractText('.employer'),
@@ -124,20 +135,14 @@ def run():
     try:
         run = client.actor("apify/website-content-crawler").call(run_input=run_input, wait_secs=120)
         dataset = client.dataset(run["defaultDatasetId"]).list_items().items
-        
         print(f"📦 Received {len(dataset)} raw items from crawler")
         
-        # Debug: print first 3 items
-        for i, item in enumerate(dataset[:3]):
-            print(f"\n🔍 DEBUG ITEM {i+1}:")
-            for key in ["title", "company", "location", "salary"]:
-                val = item.get(key, "N/A")
-                print(f"   {key}: {str(val)[:100]}")
-        
-        for item in dataset:
+        for idx, item in enumerate(dataset, 1):
             url = item.get("url", "")
             if not url or url in seen_urls: continue
             seen_urls.add(url)
+            
+            # Normalize keys
             job = {
                 "title": item.get("title", "") or item.get("pageTitle", ""),
                 "company": item.get("company", "") or item.get("organization", ""),
@@ -146,7 +151,9 @@ def run():
                 "url": url,
                 "description": item.get("description", "") or item.get("text", "")
             }
-            if filter_job(job, debug=True):
+            
+            # Debug filter evaluation WITH field values
+            if filter_job(job, debug=True, debug_id=f"ITEM_{idx}"):
                 matched.append(job)
                 
     except Exception as e:
@@ -159,7 +166,7 @@ def run():
         sync_to_sheets(matched)
         send_webhook(matched)
     else:
-        print("📭 No new matches this run. Check debug logs above.")
+        print("📭 No new matches. Check FILTER DEBUG logs above to tune criteria.")
 
 if __name__ == "__main__":
     run()
