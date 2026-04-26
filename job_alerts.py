@@ -1,4 +1,5 @@
 import os, json, re, base64, requests
+from bs4 import BeautifulSoup
 from apify_client import ApifyClient
 import gspread
 from google.oauth2.service_account import Credentials
@@ -17,15 +18,66 @@ ENTRY_LEVEL_TAGS = ["entry", "junior", "intern", "graduate", "associate", "nysc"
 # ================= HELPER FUNCTIONS =================
 def parse_salary(text: str) -> float:
     if not text: return 0
+    has_k = "k" in str(text).lower()
     cleaned = re.sub(r'[₦,\s]', '', str(text).lower())
-    nums = re.findall(r'(\d+)(?:k|kngn|ngn)?', cleaned)
+    nums = re.findall(r'(\d+(?:\.\d+)?)', cleaned)
     if not nums: return 0
-    values = [float(n) * (1000 if 'k' in cleaned else 1) for n in nums]
+    values = [float(n) * (1000 if has_k else 1) for n in nums]
     return min(values)
 
 def is_entry_level(title: str, desc: str) -> bool:
     combined = (title + " " + desc).lower()
     return any(tag in combined for tag in ENTRY_LEVEL_TAGS)
+
+def extract_job_from_html(html: str, url: str) -> dict:
+    """Parse Jobberman/MyJobMag HTML with BeautifulSoup"""
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    # Try multiple selector strategies for Nigerian sites
+    title = (
+        soup.find('h1') or 
+        soup.find('[itemprop="title"]') or 
+        soup.find(class_=re.compile(r'job-title|title|position', re.I)) or
+        soup.find('meta', property='og:title')
+    )
+    title_text = title.get('content', '').strip() if title and title.get('content') else (title.get_text(strip=True) if title else '')
+    
+    company = (
+        soup.find('[itemprop="hiringOrganization"]') or
+        soup.find(class_=re.compile(r'company-name|employer|organization', re.I)) or
+        soup.find('a', class_=re.compile(r'company', re.I))
+    )
+    company_text = company.get_text(strip=True) if company else ''
+    
+    location = (
+        soup.find('[itemprop="jobLocation"]') or
+        soup.find(class_=re.compile(r'location|address|place', re.I))
+    )
+    location_text = location.get_text(strip=True) if location else ''
+    
+    salary = (
+        soup.find(class_=re.compile(r'salary|remuneration|pay|wage', re.I)) or
+        soup.find(string=re.compile(r'₦|salary|pay|ngn|k\/month', re.I))
+    )
+    salary_text = salary.get_text(strip=True) if salary and hasattr(salary, 'get_text') else (str(salary) if salary else '')
+    
+    # Fallback: search entire page text for keywords if selectors fail
+    if not title_text or not location_text:
+        page_text = soup.get_text(' ', strip=True)
+        if not title_text:
+            # Try to extract title from URL or meta
+            title_text = url.split('/')[-1].replace('-', ' ').title() or soup.title.string if soup.title else ''
+        if not location_text and TARGET_LOCATION in page_text.lower():
+            location_text = TARGET_LOCATION
+    
+    return {
+        "title": title_text[:200],
+        "company": company_text[:100],
+        "location": location_text[:100],
+        "salary": salary_text[:100] if salary_text else '',
+        "url": url,
+        "description": page_text[:1500] if 'page_text' in locals() else soup.get_text(' ', strip=True)[:1500]
+    }
 
 def filter_job(job: dict, debug: bool = False, debug_id: str = "") -> bool:
     title = job.get("title", "") or ""
@@ -37,17 +89,15 @@ def filter_job(job: dict, debug: bool = False, debug_id: str = "") -> bool:
     if debug:
         print(f"\n🔎 FILTER DEBUG [{debug_id}]:")
         print(f"   title: '{title[:80]}{'...' if len(title)>80 else ''}'")
-        print(f"   company: '{company[:50]}'")
         print(f"   location: '{location}'")
         print(f"   salary: '{salary_text}'")
-        print(f"   keywords in title/desc: {any(kw in (title+description).lower() for kw in KEYWORDS)}")
     
-    # Location check
-    if TARGET_LOCATION not in location and "lagos state" not in location:
-        if debug: print(f"   ❌ REJECTED: location '{location}' doesn't contain '{TARGET_LOCATION}'")
+    # Location check (more flexible)
+    if TARGET_LOCATION not in location and "lagos state" not in location and "vi" not in location and "ikeja" not in location and "surulere" not in location:
+        if debug: print(f"   ❌ REJECTED: location '{location}' doesn't match Lagos areas")
         return False
     
-    # Salary check (only reject if salary was detected but too low)
+    # Salary check (only reject if detected but too low)
     salary_num = parse_salary(salary_text)
     if salary_num > 0 and salary_num < MIN_SALARY_NGN:
         if debug: print(f"   ❌ REJECTED: salary ₦{salary_num:,.0f} < ₦{MIN_SALARY_NGN:,}")
@@ -57,13 +107,13 @@ def filter_job(job: dict, debug: bool = False, debug_id: str = "") -> bool:
     
     # Entry-level check
     if not is_entry_level(title, description):
-        if debug: print(f"   ❌ REJECTED: no entry-level tags in title/desc")
+        if debug: print(f"   ❌ REJECTED: no entry-level tags")
         return False
     
     # Keyword check
     title_desc = (title + " " + description).lower()
     if not any(kw in title_desc for kw in KEYWORDS):
-        if debug: print(f"   ❌ REJECTED: none of {KEYWORDS} found in title/desc")
+        if debug: print(f"   ❌ REJECTED: keywords not found")
         return False
     
     if debug: print(f"   ✅ PASSED ALL FILTERS")
@@ -103,35 +153,26 @@ def run():
         urls.append(f"https://www.jobberman.com/jobs?keyword={kw_enc}&location=Lagos")
         urls.append(f"https://www.myjobmag.com/jobs/keyword/{kw.replace(' ', '-')}/lagos")
     
+    # ✅ FIXED: Return raw HTML for Python parsing
     run_input = {
         "startUrls": [{"url": u} for u in urls],
         "maxCrawlPages": 20,
         "maxRequestRetries": 1,
         "requestTimeoutSecs": 45,
         "usePlaywright": True,
+        # Simple pageFunction that just returns raw HTML
         "pageFunction": """async function pageFunction(context) {
             const { page, request } = context;
             await page.waitForLoadState('networkidle').catch(() => {});
-            const title = await page.title();
-            if (!title.toLowerCase().includes('job') && !title.toLowerCase().includes('career')) return;
-            const extractText = async (selector) => {
-                try {
-                    const el = await page.$(selector);
-                    return el ? await el.evaluate(el => el.textContent.trim()) : '';
-                } catch { return ''; }
-            };
             return {
-                title: await extractText('h1') || await extractText('[itemprop="title"]') || await extractText('.job-title') || title,
-                company: await extractText('[itemprop="hiringOrganization"]') || await extractText('.company-name') || await extractText('.employer'),
-                location: await extractText('[itemprop="jobLocation"]') || await extractText('.location') || await extractText('.job-location'),
-                salary: await extractText('.salary') || await extractText('[itemprop="baseSalary"]') || await extractText('.remuneration'),
                 url: request.url,
-                description: await page.evaluate(() => document.body.innerText.slice(0, 1500))
+                html: await page.content(),
+                title: await page.title()
             };
         }"""
     }
     
-    print("🔄 Running Apify website crawler...")
+    print("🔄 Running Apify crawler (raw HTML mode)...")
     try:
         run = client.actor("apify/website-content-crawler").call(run_input=run_input, wait_secs=120)
         dataset = client.dataset(run["defaultDatasetId"]).list_items().items
@@ -139,34 +180,28 @@ def run():
         
         for idx, item in enumerate(dataset, 1):
             url = item.get("url", "")
-            if not url or url in seen_urls: continue
+            html = item.get("html", "")
+            if not url or not html or url in seen_urls: continue
             seen_urls.add(url)
             
-            # Normalize keys
-            job = {
-                "title": item.get("title", "") or item.get("pageTitle", ""),
-                "company": item.get("company", "") or item.get("organization", ""),
-                "location": item.get("location", "") or item.get("address", ""),
-                "salary": item.get("salary", ""),
-                "url": url,
-                "description": item.get("description", "") or item.get("text", "")
-            }
+            # Parse HTML in Python
+            job = extract_job_from_html(html, url)
             
-            # Debug filter evaluation WITH field values
+            # Debug filter evaluation
             if filter_job(job, debug=True, debug_id=f"ITEM_{idx}"):
                 matched.append(job)
                 
     except Exception as e:
-        print(f"⚠️ Apify crawl failed: {e}")
+        print(f"⚠️ Crawl failed: {e}")
         import traceback; traceback.print_exc()
         return
     
-    print(f"\n✅ Final: Found {len(matched)} matching jobs out of {len(seen_urls)} unique URLs crawled.")
+    print(f"\n✅ Final: Found {len(matched)} matching jobs out of {len(seen_urls)} URLs.")
     if matched:
         sync_to_sheets(matched)
         send_webhook(matched)
     else:
-        print("📭 No new matches. Check FILTER DEBUG logs above to tune criteria.")
+        print("📭 No matches. Check FILTER DEBUG logs above.")
 
 if __name__ == "__main__":
     run()
