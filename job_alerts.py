@@ -66,7 +66,7 @@ def run():
         "extendOutputFunction": "($) => ({})"
     }
     print("🔄 Running Apify job search...")
-    run = client.actor("apify/job-search").call(run_input=run_input, wait_for_finish=60)
+    run = client.actor("apify/job-search").call(run_input=run_input, wait_secs=120)
     dataset = client.dataset(run["defaultDatasetId"]).list_items().items
     seen_urls = set()
     matched = []
